@@ -361,3 +361,260 @@ Avoid:
 - Simple arithmetic (the compiler handles this well)
 - Instructions the compiler already generates correctly
 - Anything that breaks register allocation
+
+
+## 7. Instruction Scheduling and Dual-Issue Optimization
+
+### 7.1 GPU Instruction Scheduling
+
+Unlike CPUs, GPUs don't reorder instructions at runtime. The compiler schedules instructions, and the hardware executes them in order (within each warp). GPUs exploit latency hiding through warp interleaving — when one warp stalls on memory, the SM switches to another warp.
+
+Key principle: **Minimize stall cycles per warp.** The compiler does this by:
+1. Moving independent instructions between dependent ones (instruction-level parallelism).
+2. Ensuring enough independent work to hide memory latency.
+
+### 7.2 Dual Issue
+
+Modern NVIDIA GPUs (including Blackwell) support dual-issue — issuing two independent instructions in the same clock cycle from the same warp. This effectively doubles throughput for certain instruction mixes.
+
+Dual-issue pairs (Blackwell sm_100):
+- Two independent ALU instructions (e.g., `add.f32` + `mul.f32`)
+- One ALU + one memory instruction (e.g., `add.f32` + `ld.global.f32`)
+- Two independent memory instructions (to different cache lines)
+
+NOT dual-issuable:
+- Instructions that read/write the same register
+- WGMMA instructions (they have their own pipeline)
+- TMA instructions (hardware-managed)
+
+### 7.3 How to Encourage Dual Issue
+
+In CUDA:
+```cuda
+// Good: independent operations that can dual-issue
+float a = x[i];
+float b = y[i];
+float c = a + b;    // ALU
+float d = a * b;    // ALU (independent of c)
+z[i] = c + d;
+```
+
+For SAM 3.1 convolution kernels:
+- Interleave TMA loads with register math (the compiler usually does this).
+- Ensure WGMMA accumulator computation doesn't block on the WGMMA pipeline.
+
+### 7.4 Checking SASS for Dual Issue
+
+Use `cuobjdump` to verify the compiler generated dual-issue pairs:
+
+```
+cuobjdump -sass my_app | grep -A 20 "MyKernel"
+```
+
+Two instructions at the same offset indicates dual issue:
+```
+/*00a0*/  IADD3 R4, R4, 0x4, RZ ;       // ALU
+/*00a0*/  LDG.E R8, [R12+0x10] ;        // Memory (same cycle = dual issue)
+```
+
+### 7.5 Compiler Hints for Better Scheduling
+
+```cuda
+// Unroll hint
+#pragma unroll 4
+for (int i = 0; i < N; i++) {
+    acc += data[i] * weights[i];
+}
+
+// Force inline for better scheduling across function boundaries
+__device__ __forceinline__ float compute(float a, float b) { ... }
+
+// Restrict pointers for more aggressive scheduling
+__global__ void kernel(const float* __restrict__ input,
+                       float* __restrict__ output) { ... }
+```
+
+## 8. Memory Instruction Reordering for Coalescing
+
+### 8.1 What is Memory Coalescing?
+
+When a warp (32 threads) accesses global memory, the hardware coalesces accesses to consecutive addresses into as few memory transactions as possible:
+- **128-byte cache line** — if all 32 threads access within a 128-byte window, it's a single transaction.
+- **Ideal:** 32 threads x 4 bytes = 128 bytes = 1 coalesced access.
+- **Worst case:** 32 threads x scattered addresses = 32 separate transactions.
+
+### 8.2 Compiler-Generated Coalescing
+
+The nvcc compiler automatically reorders memory instructions to improve coalescing when:
+- Array accesses are contiguous: `data[threadIdx.x]`
+- Stride-1 pattern: `data[base + threadIdx.x]`
+
+Not coalesced (compiler cannot fix):
+```cuda
+// Strided access — each thread reads every 32nd element
+float val = data[threadIdx.x * 32];  // stride = 32
+```
+
+Coalesced:
+```cuda
+float val = data[threadIdx.x];  // stride = 1
+```
+
+### 8.3 Shared Memory Bank Conflict Avoidance
+
+Shared memory is divided into 32 banks. Accesses that hit the same bank from different threads cause bank conflicts (serialized access).
+
+For Blackwell SAM 3.1:
+- Shared memory is swizzled by TMA hardware (automatic bank conflict avoidance).
+- CUTLASS handles swizzle patterns in its SharedStorage layouts.
+- You typically don't need to manually pad shared memory when using CUTLASS TMA kernels.
+
+For custom shared memory access:
+```cuda
+// Fix: add padding
+__shared__ float smem[32][33];  // 33 instead of 32 to avoid bank conflicts
+```
+
+
+## 9. How Much Can PTX Optimization Improve Over CUTLASS Defaults?
+
+### 9.1 CUTLASS Baseline Performance
+
+CUTLASS is already heavily optimized. NVIDIA's engineers spend significant effort on:
+- Optimal wgmma/tma instruction sequences
+- Software pipelining (staged TMA loads overlapping with compute)
+- Register allocation for large accumulator tiles
+- Shared memory layout for bank-conflict-free access
+
+For most workloads, CUTLASS 3.x with sm_100 targets achieves **90-95% of theoretical peak throughput**.
+
+### 9.2 Where PTX/SASS Optimization Can Help
+
+| Optimization | Typical Improvement | Effort |
+|---|---|---|
+| `--use_fast_math` | 5-15% for math-bound kernels | Low |
+| Register cap tuning | 3-10% (improved occupancy) | Medium |
+| `--maxrregcount` spill analysis | 5-20% (avoid spills or improve occ.) | Medium |
+| Inline PTX for specific ops | 2-8% for targeted operations | High |
+| SASS hand-scheduling | 5-15% for critical inner loops | Very High |
+| LTO cross-file inlining | 2-5% | Low (just enable flag) |
+| Dual-issue optimization | 3-10% for compute-bound | High |
+| Shared memory layout tuning | 2-8% for memory-bound | Medium |
+
+### 9.3 Realistic Expectations for SAM 3.1
+
+For a well-tuned CUTLASS-based SAM 3.1 inference pipeline:
+- **Compiler flags alone** (-O3, --use_fast_math, register tuning): **3-8%** improvement.
+- **LTO + compiler flags**: **5-10%** improvement.
+- **Hand-optimized PTX for critical kernels** (attention, conv): **10-20%** improvement over compiler defaults.
+- **SASS-level hand-tuning**: **5-15%** additional (diminishing returns, very high effort).
+
+**Total realistic improvement: 10-25%** over naive CUTLASS defaults with careful optimization.
+
+**Important:** Most of the gain comes from getting the right CUTLASS kernel configs (tile sizes, pipeline stages, warp specialization strategy), not from low-level PTX hacking. Focus there first.
+
+## 10. Practical: Compiler Flags for SAM 3.1
+
+### 10.1 Recommended Build Configuration
+
+```
+nvcc \
+  -O3 \
+  --use_fast_math \
+  -arch=sm_100 \
+  -lineinfo \
+  --generate-code arch=compute_100,code=sm_100 \
+  --generate-code arch=compute_100,code=compute_100 \
+  --split-compile=32 \
+  -Xptxas -v \
+  -Xptxas -warn-spills \
+  -Xptxas -warn-lmem-usage \
+  -Xptxas -dlcm=cg \
+  --ftemplate-backtrace-limit=0 \
+  --ftemplate-depth=1024 \
+  -DNDEBUG \
+  sam31_inference.cu \
+  -lcublas -lcublasLt -lcudart \
+  -o sam31_infer
+```
+
+### 10.2 With LTO (Production Builds)
+
+```
+# Compile
+nvcc -O3 --use_fast_math -arch=sm_100 -dlto -lineinfo \
+  --split-compile=32 \
+  -Xptxas -v -Xptxas -warn-spills \
+  -Xptxas -dlcm=cg \
+  -c sam31_encoder.cu -o sam31_encoder.o
+
+nvcc -O3 --use_fast_math -arch=sm_100 -dlto -lineinfo \
+  --split-compile=32 \
+  -Xptxas -v -Xptxas -warn-spills \
+  -Xptxas -dlcm=cg \
+  -c sam31_decoder.cu -o sam31_decoder.o
+
+# Link
+nvcc -O3 --use_fast_math -arch=sm_100 -dlto \
+  sam31_encoder.o sam31_decoder.o \
+  -lcublas -lcublasLt -lcudart \
+  -o sam31_infer
+```
+
+### 10.3 CMake Integration
+
+```cmake
+# CMakeLists.txt
+set(CMAKE_CUDA_FLAGS_RELEASE "-O3 --use_fast_math -lineinfo --split-compile=32")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xptxas -v -Xptxas -warn-spills")
+
+# For specific kernels
+set_source_files_properties(sam31_attention.cu PROPERTIES
+  COMPILE_FLAGS "--maxrregcount=224 -Xptxas -dlcm=cg"
+)
+```
+
+### 10.4 Verification Checklist
+
+After building, verify:
+
+```
+# 1. Check register usage
+nvcc -O3 --use_fast_math -arch=sm_100 -Xptxas -v sam31_inference.cu 2>&1 | \
+  grep -E "(registers|bytes smem|spill)"
+
+# 2. Verify no local memory spills
+nvcc -O3 --use_fast_math -arch=sm_100 -Xptxas -warn-spills sam31_inference.cu 2>&1 | \
+  grep -i spill
+
+# 3. Profile with Nsight Compute
+ncu --set full --launch-skip 10 --launch-count 1 \
+  -o sam31_profile \
+  ./sam31_infer --input test_image.png
+
+# 4. Check SASS for dual-issue
+cuobjdump -sass sam31_infer | grep -A 5 "sam31_attention"
+
+# 5. Verify FP8 / WGMMA usage
+cuobjdump -sass sam31_infer | grep -c wgmma
+```
+
+## Summary
+
+| Optimization Category | Key Actions | Expected Gain |
+|---|---|---|
+| **Compiler flags** | `-O3`, `--use_fast_math`, `--split-compile` | 3-8% |
+| **Register tuning** | `-Xptxas -v` then `--maxrregcount` | 3-10% |
+| **LTO** | `-dlto` on compile + link | 2-5% |
+| **Cache policy** | `-Xptxas -dlcm=cg` for Tensor Core kernels | 1-3% |
+| **Inline PTX** | Critical math, cache hints, barriers | 2-8% |
+| **SASS validation** | `cuobjdump` analysis, dual-issue check | Prevents regressions |
+| **CUTLASS config** | Tile sizes, pipeline stages, warp specialization | 10-30% (biggest lever) |
+
+**Priority order for SAM 3.1:**
+1. Get CUTLASS kernel configs right (tile sizes, pipeline depth)
+2. Set compiler flags (the recommended set above)
+3. Analyze register usage and tune --maxrregcount
+4. Enable LTO for production builds
+5. Profile with Nsight Compute and optimize hotspots
+6. Only then consider inline PTX or SASS hand-tuning
